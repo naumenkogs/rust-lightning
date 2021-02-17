@@ -194,6 +194,10 @@ struct PathBuildingHop {
 	/// we don't fall below the minimum. Should not be updated manually and
 	/// generally should not be accessed.
 	htlc_minimum_msat: u64,
+	/// Keeps track of sats we overpaid to hit htlc_minimum_msat on this hop. It is useful for
+	/// routing, so that we know how much a hop has to actually pay in fees: the total fee is
+	/// next_hop_use_fee_msat + overpaid_fee_msat.
+	overpaid_fee_msat: u64,
 }
 
 impl PathBuildingHop {
@@ -238,8 +242,7 @@ impl PaymentPath {
 
 	// If an amount transferred by the path is updated, the fees should be adjusted.
 	// Any other way to change fees may result in an inconsistency.
-	// Also, it's only safe to reduce the value, to not violate limits like
-	// htlc_minimum_msat.
+	// Also, it's only safe to reduce the value, to not violate channel upper bounds.
 	fn update_value_and_recompute_fees(&mut self, value_msat: u64) {
 		if value_msat == self.hops.last().unwrap().route_hop.fee_msat {
 			// Nothing to change.
@@ -248,9 +251,10 @@ impl PaymentPath {
 		assert!(value_msat < self.hops.last().unwrap().route_hop.fee_msat);
 
 		let mut total_fee_paid_msat = 0 as u64;
-		// TODO: while reducing the transferred value on hop N, we could cause some N+M hop to fall
-		// below its htlc_minimum_msat in terms of amount being transferred that. We should handle
-		// it here similarly to how we handle it in add_entry!.
+		// While reducing the transferred value on hop N, we could cause some N+M hop to fall
+		// below its htlc_minimum_msat in terms of amount being transferred that. We handle it here
+		// similarly to add_entry! by tracking incl_fee_next_hops_htlc_minimum_msat.
+		let mut incl_fee_next_hops_htlc_minimum_msat = 0;
 		for i in (0..self.hops.len()).rev() {
 			let last_hop = i == self.hops.len() - 1;
 
@@ -269,7 +273,8 @@ impl PaymentPath {
 			// set it too high just to maliciously take more fees by exploiting this
 			// match htlc_minimum_msat logic.
 			let mut cur_hop_transferred_amount_msat = total_fee_paid_msat + value_msat;
-			if let Some(extra_fees_msat) = cur_hop.htlc_minimum_msat.checked_sub(cur_hop_transferred_amount_msat) {
+			let effective_htlc_minimum_msat = cmp::max(incl_fee_next_hops_htlc_minimum_msat, cur_hop.htlc_minimum_msat);
+			if let Some(extra_fees_msat) = effective_htlc_minimum_msat.checked_sub(cur_hop_transferred_amount_msat) {
 				cur_hop_transferred_amount_msat += extra_fees_msat;
 				total_fee_paid_msat += extra_fees_msat;
 				cur_hop_fees_msat += extra_fees_msat;
@@ -299,6 +304,12 @@ impl PaymentPath {
 					unreachable!();
 				}
 			}
+
+			// Recompute whole-path htlc_minimum_msat, so that previous hops won't underpay.
+			incl_fee_next_hops_htlc_minimum_msat = match compute_fees(incl_fee_next_hops_htlc_minimum_msat, cur_hop.channel_fees) {
+				Some(fee_msat) => cmp::max(fee_msat, cur_hop.htlc_minimum_msat),
+				None => unreachable!(), // Should have been handled in add_entry.
+			};
 		}
 	}
 }
@@ -496,21 +507,21 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 
 					let value_contribution_msat = cmp::min(available_value_contribution_msat, $next_hops_value_contribution);
 					// Includes paying fees for the use of the following channels.
-					let amount_to_transfer_over_msat: u64 = match value_contribution_msat.checked_add($next_hops_fee_msat) {
+					let mut amount_to_transfer_over_msat: u64 = match value_contribution_msat.checked_add($next_hops_fee_msat) {
 						Some(result) => result,
 						// Can't overflow due to how the values were computed right above.
 						None => unreachable!(),
 					};
-					let over_path_minimum_msat = amount_to_transfer_over_msat >= $directional_info.htlc_minimum_msat &&
-						amount_to_transfer_over_msat >= $incl_fee_next_hops_htlc_minimum_msat;
 
-					// If HTLC minimum is larger than the amount we're going to transfer, we shouldn't
-					// bother considering this channel.
-					// Since we're choosing amount_to_transfer_over_msat as maximum possible, it can
-					// be only reduced later (not increased), so this channel should just be skipped
-					// as not sufficient.
-					// TODO: Explore simply adding fee to hit htlc_minimum_msat
-					if contributes_sufficient_value && over_path_minimum_msat {
+					// If HTLC minimum is larger than the amount we're going to transfer, we shouldn
+					// transfer that value instead, thus overpaying fees.
+					let effective_htlc_minimum_msat = cmp::max($directional_info.htlc_minimum_msat, $incl_fee_next_hops_htlc_minimum_msat);
+					let overpaid_fee_msat = match effective_htlc_minimum_msat.checked_sub(amount_to_transfer_over_msat) {
+						Some(fee_msat) => fee_msat,
+						None => 0,
+					};
+					amount_to_transfer_over_msat += overpaid_fee_msat;
+					if contributes_sufficient_value  {
 						let hm_entry = dist.entry(&$src_node_id);
 						let old_entry = hm_entry.or_insert_with(|| {
 							// If there was previously no known way to access
@@ -542,6 +553,7 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 								hop_use_fee_msat: u64::max_value(),
 								total_fee_msat: u64::max_value(),
 								htlc_minimum_msat: $directional_info.htlc_minimum_msat,
+								overpaid_fee_msat
 							}
 						});
 
@@ -588,28 +600,26 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 							},
 						};
 
-						// Update the way of reaching $src_node_id with the given $chan_id (from $dest_node_id),
-						// if this way is cheaper than the already known
+						// Update the way of reaching $src_node_id with the given $chan_id (from
+						// $dest_node_id), if this way is cheaper than the already known
 						// (considering the cost to "reach" this channel from the route destination,
-						// the cost of using this channel,
+						// the cost of using this channel (with possible overpayment for htlc min)
 						// and the cost of routing to the source node of this channel).
-						// Also, consider that htlc_minimum_msat_difference, because we might end up
-						// paying it. Consider the following exploit:
-						// we use 2 paths to transfer 1.5 BTC. One of them is 0-fee normal 1 BTC path,
-						// and for the other one we picked a 1sat-fee path with htlc_minimum_msat of
-						// 1 BTC. Now, since the latter is more expensive, we gonna try to cut it
-						// by 0.5 BTC, but then match htlc_minimum_msat by paying a fee of 0.5 BTC
-						// to this channel.
+						// Consider the following exploit: we use 2 paths to transfer 1.5 BTC.
+						// One of them is 0-fee normal 1 BTC path, and for the other one we picked a
+						// 1sat-fee path with htlc_minimum_msat of  1 BTC. Now, since the latter is
+						// more expensive, we gonna try to cut it by 0.5 BTC, but then match
+						// htlc_minimum_msat by paying a fee of 0.5 BTC to this channel.
 						// TODO: this scoring could be smarter (e.g. 0.5*htlc_minimum_msat here).
 						let mut old_cost = old_entry.total_fee_msat;
-						if let Some(increased_old_cost) = old_cost.checked_add(old_entry.htlc_minimum_msat) {
+						if let Some(increased_old_cost) = old_cost.checked_add(old_entry.overpaid_fee_msat) {
 							old_cost = increased_old_cost;
 						} else {
 							old_cost = u64::max_value();
 						}
 
 						let mut new_cost = total_fee_msat;
-						if let Some(increased_new_cost) = new_cost.checked_add($directional_info.htlc_minimum_msat) {
+						if let Some(increased_new_cost) = new_cost.checked_add(overpaid_fee_msat) {
 							new_cost = increased_new_cost;
 						} else {
 							new_cost = u64::max_value();
@@ -629,9 +639,19 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 								cltv_expiry_delta: $directional_info.cltv_expiry_delta as u32,
 							};
 							old_entry.channel_fees = $directional_info.fees;
-							// It's probably fine to replace the old entry, because the new one
-							// passed the htlc_minimum-related checks above.
-							old_entry.htlc_minimum_msat = $directional_info.htlc_minimum_msat;
+							old_entry.htlc_minimum_msat = old_entry.htlc_minimum_msat;
+							// These info about an entry is only implicitly associated with
+							// the path which will be taken further: for example, if there are
+							// two options to get here from the payee side, we will store the
+							// cheapest, although it might have higher overpayment fee on this
+							// hop to match htlc_minimum_msat. Then, if the other path is associated
+							// with this entry for some reason, it might not be able to pay htlc_min
+							// anymore. To avoid that, here we take the worst-case values.
+							// It can't really be exploited because it's all about getting to one
+							// node, which should not have too-high fees in the first place,
+							// because otherwise it can be "punished" by this selection even if
+							// only one channel there is too expensive.
+							old_entry.overpaid_fee_msat = cmp::max(overpaid_fee_msat, old_entry.overpaid_fee_msat);
 						}
 					}
 				}
@@ -817,11 +837,11 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 					// We "propagate" the fees one hop backward (topologically) here,
 					// so that fees paid for a HTLC forwarding on the current channel are
 					// associated with the previous channel (where they will be subtracted).
-					ordered_hops.last_mut().unwrap().route_hop.fee_msat = new_entry.hop_use_fee_msat;
+					ordered_hops.last_mut().unwrap().route_hop.fee_msat = new_entry.hop_use_fee_msat + ordered_hops.last_mut().unwrap().overpaid_fee_msat;
 					ordered_hops.last_mut().unwrap().route_hop.cltv_expiry_delta = new_entry.route_hop.cltv_expiry_delta;
 					ordered_hops.push(new_entry.clone());
 				}
-				ordered_hops.last_mut().unwrap().route_hop.fee_msat = value_contribution_msat;
+				ordered_hops.last_mut().unwrap().route_hop.fee_msat = value_contribution_msat + ordered_hops.last_mut().unwrap().overpaid_fee_msat;
 				ordered_hops.last_mut().unwrap().hop_use_fee_msat = 0;
 				ordered_hops.last_mut().unwrap().route_hop.cltv_expiry_delta = final_cltv;
 
@@ -1535,7 +1555,6 @@ mod tests {
 		});
 
 		// Check against amount_to_transfer_over_msat.
-		// We will be transferring 300_000_000 msat.
 		// Set minimal HTLC of 200_000_000 msat.
 		update_channel(&net_graph_msg_handler, &secp_ctx, &our_privkey, UnsignedChannelUpdate {
 			chain_hash: genesis_block(Network::Testnet).header.block_hash(),
@@ -1565,10 +1584,9 @@ mod tests {
 			excess_data: Vec::new()
 		});
 
-		// Not possible to send 299_999_999: we first allocate 200_000_000 for the channel#12,
-		// and then the amount_to_transfer_over_msat over channel#2 is less than our limit.
-		if let Err(LightningError{err, action: ErrorAction::IgnoreError}) = get_route(&our_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2], None, &Vec::new(), 199_999_999, 42, Arc::clone(&logger)) {
-			assert_eq!(err, "Failed to find a path to the given destination");
+		// Not possible to send 299_999_999.
+		if let Err(LightningError{err, action: ErrorAction::IgnoreError}) = get_route(&our_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2], None, &Vec::new(), 299_999_999, 42, Arc::clone(&logger)) {
+			assert_eq!(err, "Failed to find a sufficient route to the given destination");
 		} else { panic!(); }
 
 		// Lift the restriction on the first hop.
