@@ -162,7 +162,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 		}
 	}
 
-	let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new("".to_owned(), out));
+	let logger: Arc<dyn Logger> = Arc::new(test_logger::TestLogger::new("".to_owned(), out.clone()));
 
 	let our_pubkey = get_pubkey!();
 	let mut net_graph = NetworkGraph::new(genesis_block(Network::Bitcoin).header.block_hash());
@@ -274,15 +274,19 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 										if let Some(hops) = first_hops {
 											for first_hop in hops {
 												if first_hop.short_channel_id == Some(hop.short_channel_id) {
+out.locked_write("FIRST\n".as_bytes());
 													break 'find_chan_loop (None, Some(first_hop.outbound_capacity_msat),
 														0, RoutingFees { base_msat: 0, proportional_millionths: 0 });
 												}
 											}
 										}
 									}
+assert!(idx <= path.len() - 2);
 									if idx == path.len() - 2 {
 										for last_hop in last_hops {
 											if last_hop.short_channel_id == hop.short_channel_id {
+out.locked_write("LAST\n".as_bytes());
+//continue 'path_l;
 												break 'find_chan_loop (last_hop.htlc_minimum_msat,
 													last_hop.htlc_maximum_msat, last_hop.cltv_expiry_delta,
 													last_hop.fees);
@@ -293,6 +297,7 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 									// direction is in use, so we only test if we only have one filled in.
 									let upd_a = channel_limits.get(&(hop.short_channel_id, false));
 									let upd_b = channel_limits.get(&(hop.short_channel_id, true));
+out.locked_write("LIMITS!\n".as_bytes());
 									if upd_a.is_some() && upd_b.is_some() { continue 'path_l; }
 									let upd = if let Some(u) = upd_a { u } else if let Some(u) = upd_b { u } else { panic!(); };
 									break 'find_chan_loop (Some(upd.htlc_minimum_msat),
@@ -304,6 +309,9 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 											proportional_millionths: upd.fee_proportional_millionths });
 								};
 
+out.locked_write(format!("sent {} {} {} {:?}\n", idxp, idx, value_msat, route.paths).as_bytes());
+out.locked_write(format!("last hops {:?}\n", last_hops).as_bytes());
+out.locked_write(format!("sent {:?} {} {:?} {} {} {}\n", min, path_total_msat, max, expiry, fees.base_msat, fees.proportional_millionths).as_bytes());
 
 								if let Some(v) = max {
 									assert!(path_total_msat <= v);
@@ -311,12 +319,14 @@ pub fn do_test<Out: test_logger::Output>(data: &[u8], out: Out) {
 								if let Some(v) = min {
 									assert!(path_total_msat >= v);
 								}
+out.locked_write("GOOD\n".as_bytes());
 								assert!(prev_hop.fee_msat >= fees.base_msat as u64);
 								assert_eq!(prev_hop.fee_msat, fees.base_msat as u64 + fees.proportional_millionths as u64 * path_total_msat / 1_000_000);
 								path_total_msat += prev_hop.fee_msat;
 								assert_eq!(prev_hop.cltv_expiry_delta, expiry as u32);
 							}
 						}
+out.locked_write(format!("whut {} {}\n", sent_msat, value_msat).as_bytes());
 						assert_eq!(sent_msat, value_msat);
 					}
 				}

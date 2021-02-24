@@ -26,7 +26,7 @@ use std::collections::{HashMap, BinaryHeap};
 use std::ops::Deref;
 
 /// A hop in a route
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RouteHop {
 	/// The node_id of the node at this hop.
 	pub pubkey: PublicKey,
@@ -114,7 +114,7 @@ impl Readable for Route {
 }
 
 /// A channel descriptor which provides a last-hop route to get_route
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RouteHint {
 	/// The node_id of the non-target end of the route
 	pub src_node_id: PublicKey,
@@ -923,7 +923,7 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 				// Now, substract the overpaid value from the most-expensive path.
 				// TODO: this could also be optimized by also sorting by feerate_per_sat_routed,
 				// so that the sender pays less fees overall. And also htlc_minimum_msat.
-				cur_route.sort_by_key(|path| { path.hops.iter().map(|hop| hop.channel_fees.proportional_millionths).sum::<u32>() });
+				cur_route.sort_by_key(|path| { path.hops.iter().map(|hop| hop.channel_fees.proportional_millionths as u64).sum::<u64>() });
 				for expensive_payment_path in &mut cur_route {
 					if let Some(expensive_path_new_value_msat) = expensive_payment_path.get_value_msat().checked_sub(overpaid_value_msat) {
 						expensive_payment_path.update_value_and_recompute_fees(expensive_path_new_value_msat);
