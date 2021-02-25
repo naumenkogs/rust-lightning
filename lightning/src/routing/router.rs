@@ -26,7 +26,7 @@ use std::collections::{HashMap, BinaryHeap};
 use std::ops::Deref;
 
 /// A hop in a route
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RouteHop {
 	/// The node_id of the node at this hop.
 	pub pubkey: PublicKey,
@@ -115,7 +115,7 @@ impl Readable for Route {
 }
 
 /// A channel descriptor which provides a last-hop route to get_route
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RouteHint {
 	/// The node_id of the non-target end of the route
 	pub src_node_id: PublicKey,
@@ -171,7 +171,7 @@ struct DummyDirectionalChannelInfo {
 /// so that we can choose cheaper paths (as per Dijkstra's algorithm).
 /// Fee values should be updated only in the context of the whole path, see update_value_and_recompute_fees.
 /// These fee values are useful to choose hops as we traverse the graph "payee-to-payer".
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PathBuildingHop {
 	/// Hop-specific details unrelated to the path during the routing phase,
 	/// but rather relevant to the LN graph.
@@ -214,7 +214,7 @@ impl PathBuildingHop {
 
 // Instantiated with a list of hops with correct data in them collected during path finding,
 // an instance of this struct should be further modified only via given methods.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PaymentPath {
 	hops: Vec<PathBuildingHop>,
 }
@@ -590,6 +590,7 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 							}
 						}
 
+log_trace!(logger, "NEW GRAPH NODE! VC: {}", value_contribution_msat);
 						let new_graph_node = RouteGraphNode {
 							pubkey: $src_node_id,
 							lowest_fee_to_peer_through_node: total_fee_msat,
@@ -908,6 +909,8 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 	if payment_paths.len() == 0 {
 		return Err(LightningError{err: "Failed to find a path to the given destination".to_owned(), action: ErrorAction::IgnoreError});
 	}
+
+log_trace!(logger, "Potential paths {:?}", payment_paths);
 
 	if already_collected_value_msat < final_value_msat {
 		return Err(LightningError{err: "Failed to find a sufficient route to the given destination".to_owned(), action: ErrorAction::IgnoreError});
