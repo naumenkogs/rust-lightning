@@ -247,9 +247,10 @@ impl PaymentPath {
 		assert!(value_msat < self.hops.last().unwrap().route_hop.fee_msat);
 
 		let mut total_fee_paid_msat = 0 as u64;
-		// TODO: while reducing the transferred value on hop N, we could cause some N+M hop to fall
-		// below its htlc_minimum_msat in terms of amount being transferred that. We should handle
-		// it here similarly to how we handle it in add_entry!.
+		// While reducing the transferred value on hop N, we could cause some N+M hop to fall
+		// below its htlc_minimum_msat in terms of amount being transferred that. We handle it here
+		// similarly to add_entry! by tracking incl_fee_next_hops_htlc_minimum_msat.
+		let mut incl_fee_next_hops_htlc_minimum_msat = 0;
 		for i in (0..self.hops.len()).rev() {
 			let last_hop = i == self.hops.len() - 1;
 
@@ -268,7 +269,8 @@ impl PaymentPath {
 			// set it too high just to maliciously take more fees by exploiting this
 			// match htlc_minimum_msat logic.
 			let mut cur_hop_transferred_amount_msat = total_fee_paid_msat + value_msat;
-			if let Some(extra_fees_msat) = cur_hop.htlc_minimum_msat.checked_sub(cur_hop_transferred_amount_msat) {
+			let effective_htlc_minimum_msat = cmp::max(incl_fee_next_hops_htlc_minimum_msat, cur_hop.htlc_minimum_msat);
+			if let Some(extra_fees_msat) = effective_htlc_minimum_msat.checked_sub(cur_hop_transferred_amount_msat) {
 				cur_hop_transferred_amount_msat += extra_fees_msat;
 				total_fee_paid_msat += extra_fees_msat;
 				cur_hop_fees_msat += extra_fees_msat;
@@ -298,6 +300,12 @@ impl PaymentPath {
 					unreachable!();
 				}
 			}
+
+			// Recompute whole-path htlc_minimum_msat, so that previous hops won't underpay.
+			incl_fee_next_hops_htlc_minimum_msat = match compute_fees(incl_fee_next_hops_htlc_minimum_msat, cur_hop.channel_fees) {
+				Some(fee_msat) => cmp::max(fee_msat, cur_hop.htlc_minimum_msat),
+				None => unreachable!(), // Should have been handled in add_entry.
+			};
 		}
 	}
 }
