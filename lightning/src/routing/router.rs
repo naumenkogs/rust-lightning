@@ -194,6 +194,12 @@ struct PathBuildingHop {
 	/// we don't fall below the minimum. Should not be updated manually and
 	/// generally should not be accessed.
 	htlc_minimum_msat: u64,
+	/// Keeps track of the minimum value we have to hit on this hop. It is useful for routing,
+	/// so that we don't accidentally choose the next hop to be cheaper-but-underpaying-minimum.
+	/// The value which has to hit this is hop_use_fee_msat + value_contribution_msat, where
+	/// hop_use_fee_msat pays for the following hops, but is deducted on this one.
+	/// Should not be updated manually and generally should not be accessed.
+	effective_htlc_minimum_msat: u64,
 }
 
 impl PathBuildingHop {
@@ -508,8 +514,6 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 						// Can't overflow due to how the values were computed right above.
 						None => unreachable!(),
 					};
-					let over_path_minimum_msat = amount_to_transfer_over_msat >= $directional_info.htlc_minimum_msat &&
-						amount_to_transfer_over_msat >= $incl_fee_next_hops_htlc_minimum_msat;
 
 					// If HTLC minimum is larger than the amount we're going to transfer, we shouldn't
 					// bother considering this channel.
@@ -517,6 +521,8 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 					// be only reduced later (not increased), so this channel should just be skipped
 					// as not sufficient.
 					// TODO: Explore simply adding fee to hit htlc_minimum_msat
+					let effective_htlc_minimum_msat = cmp::max($directional_info.htlc_minimum_msat, $incl_fee_next_hops_htlc_minimum_msat);
+					let over_path_minimum_msat = amount_to_transfer_over_msat >= effective_htlc_minimum_msat;
 					if contributes_sufficient_value && over_path_minimum_msat {
 						let hm_entry = dist.entry(&$src_node_id);
 						let old_entry = hm_entry.or_insert_with(|| {
@@ -549,6 +555,7 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 								hop_use_fee_msat: u64::max_value(),
 								total_fee_msat: u64::max_value(),
 								htlc_minimum_msat: $directional_info.htlc_minimum_msat,
+								effective_htlc_minimum_msat,
 							}
 						});
 
@@ -638,7 +645,8 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 							old_entry.channel_fees = $directional_info.fees;
 							// It's probably fine to replace the old entry, because the new one
 							// passed the htlc_minimum-related checks above.
-							old_entry.htlc_minimum_msat = $directional_info.htlc_minimum_msat;
+							old_entry.htlc_minimum_msat = cmp::max($directional_info.htlc_minimum_msat, old_entry.htlc_minimum_msat);
+							old_entry.effective_htlc_minimum_msat = effective_htlc_minimum_msat;
 						}
 					}
 				}
@@ -812,7 +820,35 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 					}
 
 					new_entry = match dist.remove(&ordered_hops.last().unwrap().route_hop.pubkey) {
-						Some(payment_hop) => payment_hop,
+						Some(payment_hop) => {
+							if new_entry.hop_use_fee_msat + value_contribution_msat <
+								ordered_hops.last_mut().unwrap().effective_htlc_minimum_msat {
+								// This could happen if a mismatch happened in add_entry! when
+								// there is a path fork: e.g. source-A-B-payee and source-A-C-payee.
+								// The mismatch of htlc_min could happen if B is the cheapest path,
+								// but while adding A-for-B, A can't hit htlc_minimum_msat.
+								// Then, we add A-for-C because it does hit htlc_minimum msat.
+								//
+								// This block would trigger if after this we choose A-for-C
+								// as a way to reach B, and we break from the loop because this
+								// path would be invalid otherwise.
+								//
+								// The actual problem would happen when we propagate fees one hop
+								// backward (see below), the A-for-C is not sufficient to hit
+								// htlc_minimum_msat anymore.
+								//
+								// This check here attempts to check the compatibility:
+								// (fine if A-for-C just matches following C or overpays for D).
+								//
+								// TODO. this is a safe approach. It indeed avoids invalid paths,
+								// but it also could drop valid ones. Ideally, we should prevent
+								// the latter too. Although dropping is rare, because in the example
+								// above, C would be dropped from candidates, and then we just have
+								// to implement hitting htlc_minimum_msat for B in add_entry.
+								break 'paths_collection;
+							}
+							payment_hop
+						}
 						None => {
 							// If we can't reach a given node, something went wrong
 							// during path traverse.
