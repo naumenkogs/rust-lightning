@@ -509,7 +509,7 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 
 					let value_contribution_msat = cmp::min(available_value_contribution_msat, $next_hops_value_contribution);
 					// Includes paying fees for the use of the following channels.
-					let amount_to_transfer_over_msat: u64 = match value_contribution_msat.checked_add($next_hops_fee_msat) {
+					let mut amount_to_transfer_over_msat: u64 = match value_contribution_msat.checked_add($next_hops_fee_msat) {
 						Some(result) => result,
 						// Can't overflow due to how the values were computed right above.
 						None => unreachable!(),
@@ -522,8 +522,17 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 					// as not sufficient.
 					// TODO: Explore simply adding fee to hit htlc_minimum_msat
 					let effective_htlc_minimum_msat = cmp::max($directional_info.htlc_minimum_msat, $incl_fee_next_hops_htlc_minimum_msat);
-					let over_path_minimum_msat = amount_to_transfer_over_msat >= effective_htlc_minimum_msat;
-					if contributes_sufficient_value && over_path_minimum_msat {
+					println!("effective: {} {}", $directional_info.htlc_minimum_msat, $incl_fee_next_hops_htlc_minimum_msat);
+
+					// // To be paid *on the current hop* (not the previous one), to hit htlc_minimum.
+					// let mut cur_hop_extra_fee_msat = match effective_htlc_minimum_msat.checked_sub(amount_to_transfer_over_msat) {
+					// 	Some(extra_fee_msat) => extra_fee_msat,
+					// 	None => 0,
+					// };
+					// amount_to_transfer_over_msat += cur_hop_extra_fee_msat;
+					amount_to_transfer_over_msat = cmp::max(amount_to_transfer_over_msat, effective_htlc_minimum_msat);
+
+					if contributes_sufficient_value {
 						let hm_entry = dist.entry(&$src_node_id);
 						let old_entry = hm_entry.or_insert_with(|| {
 							// If there was previously no known way to access
@@ -601,6 +610,7 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 								None => u64::max_value(),
 							},
 						};
+						println!("path htlc min: {}, {} {:?}", $chan_id, $incl_fee_next_hops_htlc_minimum_msat, $directional_info.fees);
 
 						// Update the way of reaching $src_node_id with the given $chan_id (from $dest_node_id),
 						// if this way is cheaper than the already known
@@ -616,18 +626,18 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 						// to this channel.
 						// TODO: this scoring could be smarter (e.g. 0.5*htlc_minimum_msat here).
 						let mut old_cost = old_entry.total_fee_msat;
-						if let Some(increased_old_cost) = old_cost.checked_add(old_entry.htlc_minimum_msat) {
-							old_cost = increased_old_cost;
-						} else {
-							old_cost = u64::max_value();
-						}
+						// if let Some(increased_old_cost) = old_cost.checked_add(old_entry.htlc_minimum_msat) {
+						// 	old_cost = increased_old_cost;
+						// } else {
+						// 	old_cost = u64::max_value();
+						// }
 
 						let mut new_cost = total_fee_msat;
-						if let Some(increased_new_cost) = new_cost.checked_add($directional_info.htlc_minimum_msat) {
-							new_cost = increased_new_cost;
-						} else {
-							new_cost = u64::max_value();
-						}
+						// if let Some(increased_new_cost) = new_cost.checked_add($directional_info.htlc_minimum_msat) {
+						// 	new_cost = increased_new_cost;
+						// } else {
+						// 	new_cost = u64::max_value();
+						// }
 
 						if new_cost < old_cost {
 							targets.push(new_graph_node);
@@ -821,32 +831,34 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 
 					new_entry = match dist.remove(&ordered_hops.last().unwrap().route_hop.pubkey) {
 						Some(payment_hop) => {
-							if new_entry.hop_use_fee_msat + value_contribution_msat <
-								ordered_hops.last_mut().unwrap().effective_htlc_minimum_msat {
-								// This could happen if a mismatch happened in add_entry! when
-								// there is a path fork: e.g. source-A-B-payee and source-A-C-payee.
-								// The mismatch of htlc_min could happen if B is the cheapest path,
-								// but while adding A-for-B, A can't hit htlc_minimum_msat.
-								// Then, we add A-for-C because it does hit htlc_minimum msat.
-								//
-								// This block would trigger if after this we choose A-for-C
-								// as a way to reach B, and we break from the loop because this
-								// path would be invalid otherwise.
-								//
-								// The actual problem would happen when we propagate fees one hop
-								// backward (see below), the A-for-C is not sufficient to hit
-								// htlc_minimum_msat anymore.
-								//
-								// This check here attempts to check the compatibility:
-								// (fine if A-for-C just matches following C or overpays for D).
-								//
-								// TODO. this is a safe approach. It indeed avoids invalid paths,
-								// but it also could drop valid ones. Ideally, we should prevent
-								// the latter too. Although dropping is rare, because in the example
-								// above, C would be dropped from candidates, and then we just have
-								// to implement hitting htlc_minimum_msat for B in add_entry.
-								break 'paths_collection;
-							}
+							// if new_entry.hop_use_fee_msat + value_contribution_msat <
+							// 	ordered_hops.last_mut().unwrap().effective_htlc_minimum_msat {
+							// 	// This could happen if a mismatch happened in add_entry! when
+							// 	// there is a path fork: e.g. source-A-B-payee and source-A-C-payee.
+							// 	// The mismatch of htlc_min could happen if B is the cheapest path,
+							// 	// but while adding A-for-B, A can't hit htlc_minimum_msat.
+							// 	// Then, we add A-for-C because it does hit htlc_minimum msat.
+							// 	//
+							// 	// This block would trigger if after this we choose A-for-C
+							// 	// as a way to reach B, and we break from the loop because this
+							// 	// path would be invalid otherwise.
+							// 	//
+							// 	// The actual problem would happen when we propagate fees one hop
+							// 	// backward (see below), the A-for-C is not sufficient to hit
+							// 	// htlc_minimum_msat anymore.
+							// 	//
+							// 	// This check here attempts to check the compatibility:
+							// 	// (fine if A-for-C just matches following C or overpays for D).
+							// 	//
+							// 	// TODO. this is a safe approach. It indeed avoids invalid paths,
+							// 	// but it also could drop valid ones. Ideally, we should prevent
+							// 	// the latter too. Although dropping is rare, because in the example
+							// 	// above, C would be dropped from candidates, and then we just have
+							// 	// to implement hitting htlc_minimum_msat for B in add_entry.
+							// 	println!("{} Triggered {} + {} < {}", new_entry.route_hop.short_channel_id, new_entry.hop_use_fee_msat,
+							// 		value_contribution_msat, ordered_hops.last_mut().unwrap().effective_htlc_minimum_msat);
+							// 	break 'paths_collection;
+							// }
 							payment_hop
 						}
 						None => {
@@ -1578,7 +1590,6 @@ mod tests {
 		});
 
 		// Check against amount_to_transfer_over_msat.
-		// We will be transferring 300_000_000 msat.
 		// Set minimal HTLC of 200_000_000 msat.
 		update_channel(&net_graph_msg_handler, &secp_ctx, &our_privkey, UnsignedChannelUpdate {
 			chain_hash: genesis_block(Network::Testnet).header.block_hash(),
@@ -1610,8 +1621,8 @@ mod tests {
 
 		// Not possible to send 299_999_999: we first allocate 200_000_000 for the channel#12,
 		// and then the amount_to_transfer_over_msat over channel#2 is less than our limit.
-		if let Err(LightningError{err, action: ErrorAction::IgnoreError}) = get_route(&our_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2], None, &Vec::new(), 199_999_999, 42, Arc::clone(&logger)) {
-			assert_eq!(err, "Failed to find a path to the given destination");
+		if let Err(LightningError{err, action: ErrorAction::IgnoreError}) = get_route(&our_id, &net_graph_msg_handler.network_graph.read().unwrap(), &nodes[2], None, &Vec::new(), 299_999_999, 42, Arc::clone(&logger)) {
+			assert_eq!(err, "Failed to find a sufficient route to the given destination");
 		} else { panic!(); }
 
 		// Lift the restriction on the first hop.
