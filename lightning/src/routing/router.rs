@@ -308,7 +308,7 @@ impl PaymentPath {
 			// Recompute whole-path htlc_minimum_msat, so that previous hops won't underpay.
 			incl_fee_next_hops_htlc_minimum_msat = match compute_fees(incl_fee_next_hops_htlc_minimum_msat, cur_hop.channel_fees) {
 				Some(fee_msat) => cmp::max(fee_msat, cur_hop.htlc_minimum_msat),
-				None => unreachable!(), // Should have been handled in add_entry.
+				None => u64::max_value(), // This means the cheapest path is super expensive.
 			};
 		}
 	}
@@ -521,7 +521,8 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 						None => 0,
 					};
 					amount_to_transfer_over_msat += overpaid_fee_msat;
-					if contributes_sufficient_value  {
+
+					if contributes_sufficient_value && amount_to_transfer_over_msat <= *available_liquidity_msat {
 						let hm_entry = dist.entry(&$src_node_id);
 						let old_entry = hm_entry.or_insert_with(|| {
 							// If there was previously no known way to access
@@ -639,7 +640,7 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 								cltv_expiry_delta: $directional_info.cltv_expiry_delta as u32,
 							};
 							old_entry.channel_fees = $directional_info.fees;
-							old_entry.htlc_minimum_msat = old_entry.htlc_minimum_msat;
+							old_entry.htlc_minimum_msat = $directional_info.htlc_minimum_msat;
 							// These info about an entry is only implicitly associated with
 							// the path which will be taken further: for example, if there are
 							// two options to get here from the payee side, we will store the
@@ -651,7 +652,7 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 							// node, which should not have too-high fees in the first place,
 							// because otherwise it can be "punished" by this selection even if
 							// only one channel there is too expensive.
-							old_entry.overpaid_fee_msat = cmp::max(overpaid_fee_msat, old_entry.overpaid_fee_msat);
+							old_entry.overpaid_fee_msat = overpaid_fee_msat;
 						}
 					}
 				}
@@ -841,7 +842,7 @@ pub fn get_route<L: Deref>(our_node_id: &PublicKey, network: &NetworkGraph, paye
 					ordered_hops.last_mut().unwrap().route_hop.cltv_expiry_delta = new_entry.route_hop.cltv_expiry_delta;
 					ordered_hops.push(new_entry.clone());
 				}
-				ordered_hops.last_mut().unwrap().route_hop.fee_msat = value_contribution_msat + ordered_hops.last_mut().unwrap().overpaid_fee_msat;
+				ordered_hops.last_mut().unwrap().route_hop.fee_msat = cmp::max(value_contribution_msat, ordered_hops.last_mut().unwrap().htlc_minimum_msat);
 				ordered_hops.last_mut().unwrap().hop_use_fee_msat = 0;
 				ordered_hops.last_mut().unwrap().route_hop.cltv_expiry_delta = final_cltv;
 
